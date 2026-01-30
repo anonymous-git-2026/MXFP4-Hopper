@@ -1,0 +1,468 @@
+diff --git a/megatron/core/fp4_utils.py b/megatron/core/fp4_utils.py
+index 4f9e7e5d0..cf93d0d87 100644
+--- a/megatron/core/fp4_utils.py
++++ b/megatron/core/fp4_utils.py
+@@ -3,6 +3,7 @@
+ """Utility functions related to FP4 that are used throughout Megatron core"""
+ 
+ from contextlib import nullcontext
++from typing import Optional
+ 
+ import torch
+ 
+@@ -43,6 +44,9 @@ else:
+     FP4_TENSOR_CLASS = None
+ 
+ 
++FP4_VALUES_PER_SCALE = 16
++
++
+ def is_nvfp4tensor(tensor: torch.Tensor) -> bool:
+     """Check if a tensor is a Transformer Engine NVFP4Tensor."""
+     return HAVE_TE_FP4_TENSOR_CLASS and isinstance(tensor, FP4_TENSOR_CLASS)
+@@ -79,7 +83,43 @@ def dequantize_fp4_tensor(fp4_tensor: torch.Tensor) -> torch.Tensor:
+ 
+ 
+ if HAVE_TE:
++    from functools import lru_cache
++    import transformer_engine_torch as tex
+     from megatron.core import parallel_state
++    from transformer_engine.pytorch.tensor.mxfp4_tensor import MXFP4Quantizer, MXFP4Tensor
++
++    def _pack_rowwise_components(rowwise_data: torch.Tensor, rowwise_scale: torch.Tensor):
++        """Pack rowwise FP4 values and scales along the last dimension."""
++        if rowwise_data.shape[:-1] != rowwise_scale.shape[:-1]:
++            raise ValueError(
++                "rowwise_data and rowwise_scale_inv must match on all dims except the last."
++            )
++        return torch.cat((rowwise_data, rowwise_scale), dim=-1)
++
++    def _unpack_rowwise_components(packed_tensor: torch.Tensor):
++        """Split packed FP4 values/scales that were concatenated along the last dimension."""
++        if packed_tensor.dim() < 1:
++            raise ValueError("Packed FP4 tensor must have at least one dimension.")
++
++        last_dim = packed_tensor.size(-1)
++        numerator = last_dim * FP4_VALUES_PER_SCALE
++        divisor = FP4_VALUES_PER_SCALE + 1
++
++        if numerator % divisor != 0:
++            raise ValueError(
++                f"Cannot infer FP4 rowwise/scale split for last_dim={last_dim}. "
++                "Dimension must be divisible by the 17/16 packing ratio."
++            )
++
++        rowwise_width = numerator // divisor
++        scale_width = last_dim - rowwise_width
++
++        if scale_width <= 0:
++            raise ValueError("Packed FP4 tensor does not contain scale elements.")
++
++        rowwise_data = packed_tensor.narrow(-1, 0, rowwise_width).contiguous()
++        rowwise_scale = packed_tensor.narrow(-1, rowwise_width, scale_width).contiguous()
++        return rowwise_data, rowwise_scale
+ 
+     def get_fp4_recipe(config: TransformerConfig):
+         """Return fp4 recipe."""
+@@ -97,7 +137,7 @@ if HAVE_TE:
+                 fp4_recipe = _get_custom_recipe(config.fp4_quantizer_factory)
+             else:
+                 raise ValueError(
+-                    "NVFP4BlockScaling and custom are the only supported FP4 recipes. "
++                    "NVFP4BlockScaling is the only supported FP4 recipe. "
+                     "Please make sure you are using a compatible TE version >= 2.7.0.dev0."
+                 )
+         else:
+@@ -107,6 +147,52 @@ if HAVE_TE:
+             )
+         return fp4_recipe
+ 
++    @lru_cache(maxsize=None)
++    def get_fp4_quantizer():
++        # fp4_dtype = tex.DType.kFloat8E4M3
++        # fp4_dtype=fp4_dtype,
++
++        q = MXFP4Quantizer(
++            rowwise=True,
++            columnwise=False,
++        )
++        return q
++
++    def fp4_quantize(x: torch.Tensor):
++        q = get_fp4_quantizer()
++        if q is None:
++            return x
++
++        quantized_tensor = q(x)
++        return _pack_rowwise_components(
++            quantized_tensor._rowwise_data, quantized_tensor._rowwise_scale_inv
++        )
++        # return quantized_tensor._rowwise_data.contiguous(), quantized_tensor._rowwise_scale_inv.contiguous()
++    def get_fp4_tensor(x: torch.Tensor, x_scale: Optional[torch.Tensor] = None):
++        q = get_fp4_quantizer()
++        if q is None:
++            return None
++
++        if x_scale is None:
++            rowwise_data, rowwise_scale_inv = _unpack_rowwise_components(x)
++        else:
++            rowwise_data, rowwise_scale_inv = x, x_scale
++
++        bf16 = torch.bfloat16
++        fp8_dtype = tex.DType.kFloat8E4M3
++
++        return MXFP4Tensor(
++            shape=torch.Size((*rowwise_data.shape[:-1], rowwise_data.shape[-1] * 2)),
++            dtype=bf16,
++            fp8_dtype=fp8_dtype,
++            rowwise_data=rowwise_data,
++            rowwise_scale_inv=rowwise_scale_inv.contiguous(),
++            columnwise_data=None,
++            columnwise_scale_inv=None,
++            quantizer=q,
++            requires_grad=rowwise_data.requires_grad,
++        )
++
+     def get_fp4_context(config: TransformerConfig, layer_no: int = -1, is_init: bool = False):
+         """Return fp4 context manager."""
+         num_bf16_layers_at_start = (
+@@ -159,3 +245,11 @@ else:
+     def get_fp4_context(config: TransformerConfig, layer_no: int = -1, is_init: bool = False):
+         """Return nullcontext when Transformer Engine is not available."""
+         return nullcontext()
++
++    def fp4_quantize(x: torch.Tensor):
++        """Transformer Engine not available: passthrough tensor."""
++        return x
++
++    def get_fp4_tensor(x: torch.Tensor, x_scale: Optional[torch.Tensor] = None):
++        """Transformer Engine not available: no FP8 tensor wrapper."""
++        return None
+diff --git a/megatron/core/fp8_utils.py b/megatron/core/fp8_utils.py
+index d133e876d..3b3e1b75a 100644
+--- a/megatron/core/fp8_utils.py
++++ b/megatron/core/fp8_utils.py
+@@ -562,7 +562,8 @@ if HAVE_TE:
+                 )
+             elif config.fp8_recipe == Fp8Recipe.blockwise and is_te_min_version("2.3.0.dev0"):
+                 fp8_recipe = transformer_engine.common.recipe.Float8BlockScaling(
+-                    fp8_format=fp8_format
++                    fp8_format=fp8_format,
++                    save_fp4=config.save_fp4,
+                 )
+             elif config.fp8_recipe == Fp8Recipe.mxfp8:
+                 fp8_recipe = transformer_engine.common.recipe.MXFP8BlockScaling(
+diff --git a/megatron/core/fusions/fused_bias_swiglu.py b/megatron/core/fusions/fused_bias_swiglu.py
+index bc96444d5..19ffbcd8d 100644
+--- a/megatron/core/fusions/fused_bias_swiglu.py
++++ b/megatron/core/fusions/fused_bias_swiglu.py
+@@ -18,7 +18,10 @@ from megatron.core.fusions.fused_quant_weighted_swiglu import (
+ from megatron.core.enums import Fp8Recipe
+ ###### BIAS SWIGLU FUSION/ NO AUTOGRAD ################
+ 
+-
++from transformer_engine.pytorch.tensor.mxfp4_tensor import (
++    MXFP4Quantizer,
++    MXFP4Tensor,
++)
+ @jit_fuser
+ def swiglu(y):
+     """Performs SwiGLU (Swish-Gated Linear Unit) activation function.
+@@ -161,7 +164,7 @@ class SwiGLUFunction(torch.autograd.Function):
+ 
+     @staticmethod
+     @nvtx_decorator()
+-    def forward(ctx, input, fp8_input_store, cpu_offload_input):
++    def forward(ctx, input, fp8_input_store, cpu_offload_input, fp4_input_store):
+         """Forward pass of SwiGLU activation.
+ 
+         Args:
+@@ -172,7 +175,11 @@ class SwiGLUFunction(torch.autograd.Function):
+         Returns:
+             torch.Tensor: Result of applying SwiGLU activation.
+         """
+-        if fp8_input_store:
++        if fp4_input_store:
++            from megatron.core.fp4_utils import get_fp4_quantizer
++            fp4_quantizer = get_fp4_quantizer()
++            input_for_backward = fp4_quantizer(input)
++        elif fp8_input_store:
+             from megatron.core.fp8_utils import fp8_quantize
+ 
+             input_for_backward = fp8_quantize(Fp8Recipe.deepgemm, input, return_quantized_tensor=True)
+@@ -183,6 +190,7 @@ class SwiGLUFunction(torch.autograd.Function):
+         ctx.save_for_backward(input_for_backward)
+         ctx.ori_input_dtype = input.dtype
+         ctx.fp8_input_store = fp8_input_store
++        ctx.fp4_input_store = fp4_input_store
+         return swiglu(input)
+ 
+     @staticmethod
+@@ -200,9 +208,9 @@ class SwiGLUFunction(torch.autograd.Function):
+                 - None for fp8_input_store parameter
+         """
+         input = ctx.saved_tensors[0]
+-        input = input.dequantize(dtype=ctx.ori_input_dtype) if ctx.fp8_input_store else input
++        input = input.dequantize(dtype=ctx.ori_input_dtype) if ctx.fp8_input_store or ctx.fp4_input_store else input
+         tmp = swiglu_back(grad_output, input)
+-        return tmp, None, None
++        return tmp, None, None, None
+ 
+ 
+ class WeightedSwiGLUFunction(torch.autograd.Function):
+@@ -212,6 +220,7 @@ class WeightedSwiGLUFunction(torch.autograd.Function):
+         # input_for_backward = fp8_block_quantizer()(input) if fp8_input_store else input
+         # ctx.save_for_backward(input_for_backward, weights)
+         fp8_input_store = config.activation_func_fp8_input_store
++        fp4_input_store = config.activation_func_fp4_input_store
+         fp8_output = config.moe_expert_fc2_input_fp8  # expert fc2 inp fp8
+         fp8_recipe = config.fp8_recipe
+         if fp8_input_store and fp8_output:
+@@ -228,17 +237,24 @@ class WeightedSwiGLUFunction(torch.autograd.Function):
+         else:
+             input_for_backward = input
+             weighted_swiglu_result = weighted_swiglu(input, weights)
++        
++        if fp4_input_store:
++            from megatron.core.fp4_utils import get_fp4_quantizer
++            fp4_quantizer = get_fp4_quantizer()
++            input_for_backward = fp4_quantizer(input)
++
+         ctx.save_for_backward(input_for_backward, weights)
+         ctx.ori_input_dtype = input.dtype
+         ctx.fp8_input_store = fp8_input_store
+         ctx.fp8_recipe = fp8_recipe
+         ctx.fp8_output = config.moe_expert_input_fp8  # expert fc1 grad out fp8
++        ctx.fp4_input_store = fp4_input_store
+         return weighted_swiglu_result
+ 
+     @staticmethod
+     def backward(ctx, grad_output):
+         input, weights = ctx.saved_tensors
+-        input = input.dequantize(dtype=ctx.ori_input_dtype) if ctx.fp8_input_store else input
++        input = input.dequantize(dtype=ctx.ori_input_dtype) if ctx.fp8_input_store or ctx.fp4_input_store else input
+         if ctx.fp8_output:
+             tmp, wgrad = fused_weighted_swiglu_quant_back(
+                 grad_output, input, weights, ctx.fp8_recipe
+@@ -248,7 +264,7 @@ class WeightedSwiGLUFunction(torch.autograd.Function):
+         return tmp, wgrad, None
+ 
+ 
+-def bias_swiglu_impl(input, bias, fp8_input_store=False, cpu_offload_input=False):
++def bias_swiglu_impl(input, bias, fp8_input_store=False, cpu_offload_input=False, fp4_input_store=False):
+     """Implementation of biased SwiGLU that handles different input shapes.
+ 
+     This function reshapes the input if necessary, applies the SwiGLU activation
+@@ -273,7 +289,7 @@ def bias_swiglu_impl(input, bias, fp8_input_store=False, cpu_offload_input=False
+     if bias is not None:
+         output = BiasSwiGLUFunction.apply(input, bias, fp8_input_store, cpu_offload_input)
+     else:
+-        output = SwiGLUFunction.apply(input, fp8_input_store, cpu_offload_input)
++        output = SwiGLUFunction.apply(input, fp8_input_store, cpu_offload_input, fp4_input_store)
+ 
+     return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
+ 
+diff --git a/megatron/core/transformer/mlp.py b/megatron/core/transformer/mlp.py
+index 9b4770bee..5de79483d 100644
+--- a/megatron/core/transformer/mlp.py
++++ b/megatron/core/transformer/mlp.py
+@@ -198,6 +198,7 @@ class MLP(MegatronModule):
+                         self.config.cpu_offloading
+                         and self.config.cpu_offloading_activations
+                         and HAVE_TE,
++                        fp4_input_store=self.config.activation_func_fp4_input_store,
+                     )
+                 else:
+                     raise ValueError("Only support fusion of gelu and swiglu")
+diff --git a/megatron/core/transformer/moe/fused_a2a.py b/megatron/core/transformer/moe/fused_a2a.py
+index 9099d56b5..f603aa84e 100644
+--- a/megatron/core/transformer/moe/fused_a2a.py
++++ b/megatron/core/transformer/moe/fused_a2a.py
+@@ -15,7 +15,7 @@ except ImportError:
+ import torch
+ 
+ from megatron.core.fp8_utils import fp8_quantize, get_fp8_tensor
+-
++from megatron.core.fp4_utils import fp4_quantize, get_fp4_tensor
+ _buffer = None
+ 
+ 
+@@ -92,6 +92,8 @@ class FusedDispatch(torch.autograd.Function):
+         if config.moe_deepep_dispatch_fp8:
+             x = fp8_quantize(config.fp8_recipe, x)
+ 
++        elif config.moe_deepep_dispatch_fp4:
++            x = fp4_quantize(x)
+         # Calculate layout before actual dispatch
+         buffer = get_buffer(group, get_hidden_bytes(x))
+         (
+@@ -149,6 +151,13 @@ class FusedDispatch(torch.autograd.Function):
+                 recv_x = q_tensor
+             elif q_tensor is not None:
+                 recv_x = q_tensor.dequantize()
++        elif config.moe_deepep_dispatch_fp4:
++            q_tensor = get_fp4_tensor(recv_x)
++            if q_tensor is not None and config.moe_expert_input_fp4:
++                recv_x = q_tensor
++                
++            elif q_tensor is not None:
++                recv_x = q_tensor.dequantize()
+ 
+         return (recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle)
+ 
+diff --git a/megatron/core/transformer/moe/moe_utils.py b/megatron/core/transformer/moe/moe_utils.py
+index e73322f35..fae384211 100644
+--- a/megatron/core/transformer/moe/moe_utils.py
++++ b/megatron/core/transformer/moe/moe_utils.py
+@@ -1248,7 +1248,10 @@ def router_gating_linear(
+ def get_align_size_for_quantization(config: TransformerConfig):
+     """Get the alignment size for quantization."""
+     if config.fp8:
+-        return get_fp8_align_size(config.fp8_recipe)
++        if config.save_fp4:
++            return 32
++        else:
++            return get_fp8_align_size(config.fp8_recipe)
+     elif config.fp4:
+         return get_fp4_align_size(config.fp4_recipe)
+     return 16
+diff --git a/megatron/core/transformer/moe/shared_experts.py b/megatron/core/transformer/moe/shared_experts.py
+index 25d5db0b9..6913b28e8 100644
+--- a/megatron/core/transformer/moe/shared_experts.py
++++ b/megatron/core/transformer/moe/shared_experts.py
+@@ -199,6 +199,7 @@ class SharedExpertMLP(MLP):
+                         intermediate_parallel,
+                         bias_parallel,
+                         self.config.activation_func_fp8_input_store,
++                        fp4_input_store=self.config.activation_func_fp4_input_store,
+                     )
+                 else:
+                     raise ValueError("Only support fusion of gelu and swiglu")
+diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/transformer/transformer_config.py
+index 3ae9fd98c..8fcbf3692 100644
+--- a/megatron/core/transformer/transformer_config.py
++++ b/megatron/core/transformer/transformer_config.py
+@@ -164,6 +164,10 @@ class TransformerConfig(ModelParallelConfig):
+     """Store the input of MLP activation function in FP8 for backprop to save memory.
+     The stored input is casted back to the original precision before backprop compuatation."""
+ 
++    activation_func_fp4_input_store: bool = False
++    """Store the input of MLP activation function in FP8 for backprop to save memory.
++    The stored input is casted back to the original precision before backprop compuatation."""
++
+     glu_linear_offset: float = 0.0
+     """Offset term in the GLU activation function: activation_func(x[0]) * (x[1] + offset). Only 
+     used when gated_linear_unit is True"""
+@@ -387,6 +391,7 @@ class TransformerConfig(ModelParallelConfig):
+     always chooses the most recently seen value.
+ 
+     """
++    save_fp4: bool = False
+ 
+     fp8_wgrad: bool = True
+     """When set to False, override FP8 config options and do the wgrad computation
+@@ -514,16 +519,31 @@ class TransformerConfig(ModelParallelConfig):
+     communication bandwidth (approximately 2×). By default, activations are dequantized back at
+     the MoE boundary."""
+ 
++    moe_deepep_dispatch_fp4: Optional[bool] = False
++    """Whether to quantize activations to FP4 before DeepEP token dispatch (all-to-all) to reduce
++    communication bandwidth (approximately 2×). By default, activations are dequantized back at
++    the MoE boundary."""
++
+     moe_expert_input_fp8: Optional[bool] = False
+     """Whether to keep activations in FP8 after DeepEP dispatch and feed them directly into expert
+     up-projection (GroupedMLP/GEMM). Requires moe_deepep_dispatch_fp8=True and FP8-capable expert
+     GEMM kernels; reduces dequantization overhead and HBM traffic at the MoE boundary.if unsupported, runtime
+     may fall back to dequantization."""
+ 
++    moe_expert_input_fp4: Optional[bool] = False
++    """Whether to keep activations in FP4 after DeepEP dispatch and feed them directly into expert
++    up-projection (GroupedMLP/GEMM). Requires moe_deepep_dispatch_fp8=True and FP4-capable expert
++    GEMM kernels; reduces dequantization overhead and HBM traffic at the MoE boundary.if unsupported, runtime
++    may fall back to dequantization."""
++
+     moe_expert_fc2_input_fp8: Optional[bool] = False
+     """Whether to output activations to FP8 and feed them directly into expert
+     down-projection (GroupedMLP/GEMM)."""
+ 
++    moe_expert_fc2_input_fp4: Optional[bool] = False
++    """Whether to output activations to FP8 and feed them directly into expert
++    down-projection (GroupedMLP/GEMM)."""
++
+     moe_router_num_groups: Optional[int] = None
+     """Number of groups to divide experts into for group-limited routing.
+     When using group-limited routing:
+@@ -1370,7 +1390,7 @@ class TransformerConfig(ModelParallelConfig):
+                     "use_te_activation_func to False"
+                 )
+ 
+-        if self.activation_func_fp8_input_store:
++        if self.activation_func_fp8_input_store or self.activation_func_fp4_input_store:
+             if self.activation_func != F.silu or not self.gated_linear_unit:
+                 raise ValueError("Storing activation input in FP8 is supported only for SwiGLU.")
+ 
+diff --git a/megatron/training/arguments.py b/megatron/training/arguments.py
+index ae5a2dcdd..5987009ab 100644
+--- a/megatron/training/arguments.py
++++ b/megatron/training/arguments.py
+@@ -1379,6 +1379,9 @@ def _add_transformer_engine_args(parser):
+                        dest='fp8_wgrad')
+     group.add_argument('--no-fp8-gemm', action='store_true',
+                        help='override fp8 gemm with higher precision')
++    group.add_argument('--save-fp4', action='store_true',
++                    help='Execute wgrad in higher precision even for FP8 runs',
++                    dest='save_fp4')
+     group.add_argument('--transformer-impl', default='transformer_engine',
+                        choices=['local', 'transformer_engine', 'inference_optimized'],
+                        help='Which Transformer implementation to use.')
+@@ -2348,6 +2351,8 @@ def _add_training_args(parser):
+                        help='Use activation function kernel from Transformer Engine in MLP module.')
+     group.add_argument('--activation-func-fp8-input-store', action='store_true',
+                        help='Store swiglu inputs in fp8 to save activation memory.')
++    group.add_argument('--activation-func-fp4-input-store', action='store_true',
++                       help='Store swiglu inputs in fp8 to save activation memory.')
+     return parser
+ 
+ 
+@@ -3271,15 +3276,28 @@ def _add_moe_args(parser):
+                        help='Quantize activations to FP8 before DeepEP token dispatch to reduce communication bandwidth. '
+                        'By default, activations are dequantized back at the MoE boundary. '
+                        'Requires --moe-enable-deepep and --moe-token-dispatcher-type=flex. Default: disabled.')
++    group.add_argument('--moe-deepep-dispatch-fp4', action="store_true",
++                       help='Quantize activations to FP4 before DeepEP token dispatch to reduce communication bandwidth. '
++                       'By default, activations are dequantized back at the MoE boundary. '
++                       'Requires --moe-enable-deepep and --moe-token-dispatcher-type=flex. Default: disabled.')
+     group.add_argument('--moe-expert-input-fp8', action='store_true',
+                        help='After --moe-deepep-dispatch-fp8, skip dequantization at the MoE boundary and feed FP8 activations '
+                        'directly into expert up-projection (GroupedMLP/GEMM). Requires FP8-enabled expert GEMM kernels and '
+                        'matching FP8 format/granularity; typically used with --moe-permute-padding-for-fp8. '
+                        'Reduces dequant overhead and HBM traffic. Default: disabled.')
++    group.add_argument('--moe-expert-input-fp4', action='store_true',
++                       help='After --moe-deepep-dispatch-fp8, skip dequantization at the MoE boundary and feed FP4 activations '
++                       'directly into expert up-projection (GroupedMLP/GEMM). Requires FP4-enabled expert GEMM kernels and '
++                       'matching FP4 format/granularity; typically used with --moe-permute-padding-for-fp4. '
++                       'Reduces dequant overhead and HBM traffic. Default: disabled.')
+     group.add_argument('--moe-expert-fc2-input-fp8', action='store_true',
+                        help='fused_weighted_swiglu_quant and feed FP8 activations '
+                        'directly into expert down-projection (GroupedMLP/GEMM). '
+                        'Reduces dequant overhead and HBM traffic. Default: disabled.')
++    group.add_argument('--moe-expert-fc2-input-fp4', action='store_true',
++                       help='fused_weighted_swiglu_quant and feed FP4 activations '
++                       'directly into expert down-projection (GroupedMLP/GEMM). '
++                       'Reduces dequant overhead and HBM traffic. Default: disabled.')
+     group.add_argument('--moe-router-padding-for-fp8', action='store_true',
+                        help='[Compatibility alias for --moe-router-padding-for-quantization] '
+                        'Enabling this will also enable --moe-router-padding-for-quantization.')
+diff --git a/megatron/training/training.py b/megatron/training/training.py
+index 16071469d..39ba4e455 100644
+--- a/megatron/training/training.py
++++ b/megatron/training/training.py
+@@ -2433,7 +2433,6 @@ def train(
+                     )
+         num_microbatches = get_num_microbatches()
+         update_num_microbatches(args.consumed_train_samples, consistency_check=True, verbose=True)
+-
+         # Capture CUDA Graphs.
+         if (
+             args.cuda_graph_impl == "transformer_engine"
